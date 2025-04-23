@@ -1,0 +1,9 @@
+streamlit
+pywebview
+pytesseract
+sentence-transformers
+faiss-cpu
+pillow
+PyPDF2
+pdf2image
+requests
