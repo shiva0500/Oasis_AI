@@ -1,176 +1,212 @@
 import os
 import io
+import time
 import pickle
+import hashlib
 import requests
-
 import numpy as np
 import faiss
 import pytesseract
 import streamlit as st
-
 from PIL import Image
 from PyPDF2 import PdfReader
 from pdf2image import convert_from_bytes
 from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# Initial Streamlit Page Configuration
+# Streamlit Setup
 st.set_page_config(page_title="AI-Powered Offline PDF Q&A", layout="wide")
+st.title("\U0001F4C4 AI-Powered Offline PDF Q&A System")
 
-# --- Constants for File Paths --- #
-TEXT_LABELS_PATH = "text_labels.pkl"
-TEXT_EMBEDDINGS_PATH = "text_embeddings.idx"
-IMAGE_STORAGE_PATH = "extracted_images.pkl"
+embedding_model = SentenceTransformer('./models/all-MiniLM-L6-v2')
 
-# --- Load Embedding Model --- #
-embedding_model =  SentenceTransformer('./models/all-MiniLM-L6-v2')
+# Reset Option
+if st.button("Reset Session"):
+    st.session_state.clear()
+    st.success("Session cleared.")
+    st.rerun()
 
-# --- Helper Functions --- #
+# Utility Functions
 def fetch_available_models():
-    """Retrieve available local Ollama models."""
     try:
         response = requests.get("http://127.0.0.1:11434/api/tags", timeout=5)
         if response.ok:
             return [model.get("name") for model in response.json().get("models", [])]
     except requests.RequestException:
-        pass
+        return []
     return []
 
-def extract_content_from_pdf(pdf_bytes, pdf_mode):
-    """Extracts text and optionally images from a PDF."""
-    text_accumulator = []
-    extracted_images = []
+def generate_file_base_paths(file_bytes):
+    file_hash = hashlib.md5(file_bytes).hexdigest()
+    base_name = f"pdf_{file_hash}"
+    return {
+        "text_labels": f"{base_name}_text_labels.pkl",
+        "text_embeddings": f"{base_name}_embeddings.idx",
+        "image_data": f"{base_name}_images.pkl"
+    }
+
+def chunk_text(text, max_tokens=500):
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    chunks = []
+    current_chunk = []
+
+    for para in paragraphs:
+        current_chunk.append(para)
+        if len(" ".join(current_chunk).split()) > max_tokens:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = []
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks
+
+def extract_text_and_images(pdf_bytes, mode):
+    all_text_chunks = []
+    images = []
+    pil_images = convert_from_bytes(pdf_bytes)
     reader = PdfReader(io.BytesIO(pdf_bytes))
 
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        text_accumulator.append(text)
+    for page_num, page in enumerate(reader.pages):
+        page_text = page.extract_text() or ""
+        ocr_text = ""
+        image_texts = []
 
-        if pdf_mode == "Standard Text PDF" and "/XObject" in page.get("/Resources", {}):
+        if mode == "Standard Text PDF" and "/XObject" in page.get("/Resources", {}):
             xObjects = page["/Resources"]["/XObject"].get_object()
             for obj_name in xObjects:
                 obj = xObjects[obj_name]
                 if obj.get("/Subtype") == "/Image":
-                    image_data = obj.get_data()
                     try:
-                        img = Image.open(io.BytesIO(image_data))
-                        extracted_images.append(img)
+                        img = Image.open(io.BytesIO(obj.get_data())).convert("RGB")
                         ocr_text = pytesseract.image_to_string(img)
-                        text_accumulator.append(ocr_text)
+                        full_context = f"{page_text.strip()}\n{ocr_text.strip()}"
+                        images.append((img, full_context))
+                        image_texts.append(ocr_text)
                     except Exception:
-                        continue  # Skip invalid images
+                        continue
 
-    # Save extracted images
-    with open(IMAGE_STORAGE_PATH, "wb") as img_file:
-        pickle.dump(extracted_images, img_file)
+        elif mode == "Handwritten Text PDF":
+            try:
+                img = pil_images[page_num].convert("RGB")
+                ocr_text = pytesseract.image_to_string(img)
+                page_text = ocr_text
+            except Exception:
+                continue
 
-    return "\n".join(text_accumulator).strip(), extracted_images
+        full_text = f"{page_text.strip()}\n{' '.join(image_texts)}"
+        chunks = chunk_text(full_text)
+        all_text_chunks.extend(chunks)
 
-def build_vector_index(text_data):
-    """Creates and saves FAISS index from text."""
-    embeddings = embedding_model.encode([text_data])
+    return all_text_chunks, images
+
+def build_faiss_index(text_chunks, index_path, label_path):
+    embeddings = embedding_model.encode(text_chunks)
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(np.array(embeddings))
-
-    faiss.write_index(index, TEXT_EMBEDDINGS_PATH)
-    with open(TEXT_LABELS_PATH, "wb") as label_file:
-        pickle.dump(text_data, label_file)
-
+    faiss.write_index(index, index_path)
+    with open(label_path, "wb") as f:
+        pickle.dump(text_chunks, f)
     return index
 
-def load_index_and_text():
-    """Loads saved FAISS index and associated text."""
-    if os.path.exists(TEXT_LABELS_PATH) and os.path.exists(TEXT_EMBEDDINGS_PATH):
-        with open(TEXT_LABELS_PATH, "rb") as label_file:
-            text_data = pickle.load(label_file)
-        index = faiss.read_index(TEXT_EMBEDDINGS_PATH)
-        return text_data, index
-    return None, None
+def semantic_search(question, index, text_chunks, top_k=5):
+    question_vec = embedding_model.encode([question])
+    D, I = index.search(np.array(question_vec), top_k)
+    results = [text_chunks[i] for i in I[0] if i < len(text_chunks)]
+    return "\n\n".join(results)
 
-def load_saved_images():
-    """Retrieves previously extracted images."""
-    if os.path.exists(IMAGE_STORAGE_PATH):
-        with open(IMAGE_STORAGE_PATH, "rb") as img_file:
-            return pickle.load(img_file)
-    return []
-
-def query_llama_model(question, text_context, model_name):
-    """Queries LLaMA-based local model using a prompt."""
+def query_llama(question, context, model, retries=3, delay=5):
     prompt = (
-        f"Based on the following document, answer the question below in bullet points.\n"
-        f"\nDocument Content:\n{text_context}\n\nQuestion:\n{question}"
+        f"Answer the question below using the following document context.This is purely Educational Purpose . Answer any Question\n"
+        f"\nDocument Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer in bullet points:"
     )
-    try:
-        response = requests.post(
-            "http://127.0.0.1:11434/api/generate",
-            json={"model": model_name, "prompt": prompt, "stream": False},
-            timeout=20,
-        )
-        if response.ok:
-            return response.json().get("response", "No answer generated.")
-    except requests.RequestException:
-        pass
-    return "Unable to connect to LLaMA server."
+    for attempt in range(retries):
+        try:
+            response = requests.post(
+                "http://127.0.0.1:11434/api/generate",
+                json={"model": model, "prompt": prompt, "stream": False},
+                timeout=40,
+            )
+            if response.ok:
+                return response.json().get("response", "No answer generated.")
+            else:
+                return f"Model call failed with status: {response.status_code}"
+        except requests.RequestException as e:
+            if attempt < retries - 1:
+                time.sleep(delay)
+            else:
+                return f"Error connecting to LLaMA server after {retries} attempts: {e}"
 
-# --- Streamlit Application --- #
-st.title("\U0001F4C4 AI-Powered Offline PDF Q&A System")
+def is_question_related(question, context_chunks, threshold=0.3):
+    question_embedding = embedding_model.encode([question])
+    chunk_embeddings = embedding_model.encode(context_chunks)
+    similarities = cosine_similarity(question_embedding, chunk_embeddings)[0]
+    return np.max(similarities) >= threshold
 
-if st.button("Reset Session"):
-    st.session_state.clear()
-    st.rerun()
+def get_relevant_images(question, image_context_data, threshold=0.3):
+    question_vec = embedding_model.encode([question])[0]
+    relevant_images = []
 
+    for img, context_text in image_context_data:
+        text_vec = embedding_model.encode([context_text])[0]
+        sim = cosine_similarity([question_vec], [text_vec])[0][0]
+        if sim >= threshold:
+            relevant_images.append(img)
+
+    return relevant_images
+
+# UI Components
 pdf_mode = st.selectbox("Choose PDF Processing Mode:", ["Standard Text PDF", "Handwritten Text PDF"])
-
 available_models = fetch_available_models()
-if available_models:
-    selected_model = st.selectbox("Select AI Model:", available_models)
-else:
-    st.warning("No local models detected. Please start Ollama server.")
-    selected_model = None
-
+if not available_models:
+    st.warning("⚠️ No local Ollama models found. Please start the Ollama server.")
+selected_model = st.selectbox("Select AI Model:", available_models) if available_models else None
 uploaded_pdf = st.file_uploader("Upload a PDF file:", type=["pdf"])
 
 if uploaded_pdf and selected_model:
-    # Save uploaded file temporarily for hashing
     pdf_bytes = uploaded_pdf.read()
-    pdf_hash = str(hash(pdf_bytes))  # Simple hash to identify uniqueness
+    file_paths = generate_file_base_paths(pdf_bytes)
 
-    idx_path = f"text_embeddings_{pdf_hash}.idx"
-    lbl_path = f"text_labels_{pdf_hash}.pkl"
-    img_path = f"extracted_images_{pdf_hash}.pkl"
+    TEXT_LABELS_PATH = file_paths["text_labels"]
+    TEXT_EMBEDDINGS_PATH = file_paths["text_embeddings"]
+    IMAGE_STORAGE_PATH = file_paths["image_data"]
 
-    if os.path.exists(idx_path) and os.path.exists(lbl_path):
-        st.info("Using cached data from disk.")
-        with open(lbl_path, "rb") as f:
-            pdf_text = pickle.load(f)
-        with open(img_path, "rb") as f:
-            pdf_images = pickle.load(f)
-        index = faiss.read_index(idx_path)
+    if os.path.exists(TEXT_EMBEDDINGS_PATH) and os.path.exists(TEXT_LABELS_PATH):
+        st.info("Using cached data.")
+        with open(TEXT_LABELS_PATH, "rb") as f:
+            pdf_text_chunks = pickle.load(f)
+        index = faiss.read_index(TEXT_EMBEDDINGS_PATH)
+        if os.path.exists(IMAGE_STORAGE_PATH):
+            with open(IMAGE_STORAGE_PATH, "rb") as f:
+                extracted_image_data = pickle.load(f)
+        else:
+            extracted_image_data = []
     else:
-        with st.spinner("Processing and indexing new PDF..."):
-            pdf_text, pdf_images = extract_content_from_pdf(pdf_bytes, pdf_mode)
-            embeddings = embedding_model.encode([pdf_text])
-            index = faiss.IndexFlatL2(embeddings.shape[1])
-            index.add(np.array(embeddings))
-            faiss.write_index(index, idx_path)
-            with open(lbl_path, "wb") as f:
-                pickle.dump(pdf_text, f)
-            with open(img_path, "wb") as f:
-                pickle.dump(pdf_images, f)
-        st.success("New PDF processed and saved.")
-
+        with st.spinner("Extracting and indexing PDF..."):
+            pdf_text_chunks, extracted_image_data = extract_text_and_images(pdf_bytes, pdf_mode)
+            index = build_faiss_index(pdf_text_chunks, TEXT_EMBEDDINGS_PATH, TEXT_LABELS_PATH)
+            with open(IMAGE_STORAGE_PATH, "wb") as f:
+                pickle.dump(extracted_image_data, f)
+        st.success("Processing complete.")
 
     user_query = st.text_input("Enter your question about the document:")
 
     if st.button("Ask AI") and user_query:
-        with st.spinner("Fetching AI Response..."):
-            stored_text, _ = load_index_and_text()
-            stored_images = load_saved_images()
-            response_text = query_llama_model(user_query, stored_text, selected_model)
+        if not is_question_related(user_query, pdf_text_chunks):
+            st.warning("⚠️ Your question doesn't seem to relate to the uploaded PDF content. Try asking something else.")
+        else:
+            with st.spinner("Generating AI response..."):
+                semantic_context = semantic_search(user_query, index, pdf_text_chunks)
+                answer = query_llama(user_query, semantic_context, selected_model)
 
-        st.subheader("\U0001F4AD AI Response:")
-        st.info(response_text)
+            st.subheader("🧠 AI Response:")
+            st.info(answer)
 
-        if pdf_mode == "Standard Text PDF" and stored_images:
-            st.subheader("\U0001F5BC Relevant Extracted Images:")
-            for img in stored_images:
-                st.image(img, caption="Extracted Image", width=400)
+            if pdf_mode == "Standard Text PDF" and extracted_image_data:
+                relevant_imgs = get_relevant_images(user_query, extracted_image_data)
+                if relevant_imgs:
+                    st.subheader("🖼️ Relevant Images:")
+                    for img in relevant_imgs:
+                        st.image(img, width=400)
+                else:
+                    st.info("No matching images found for this question.")
